@@ -5,3 +5,6 @@
 
 # JSON 파일 무시
 *.json
+
+# .xlsx
+*.xlsx
