@@ -9,6 +9,7 @@ from tkinter import filedialog, messagebox
 from pathlib import Path
 from PIL import Image
 import logging
+from copy import deepcopy
 
 def setup_logger(log_file_path):
     """로거 설정 함수"""
@@ -29,8 +30,9 @@ def setup_logger(log_file_path):
     ch.setFormatter(formatter)
     
     # 핸들러 추가
-    logger.addHandler(fh)
-    logger.addHandler(ch)
+    if not logger.handlers:
+        logger.addHandler(fh)
+        logger.addHandler(ch)
     
     return logger
 
@@ -248,7 +250,6 @@ def distance(p1, p2):
     """p1, p2: (x, y) 형태의 튜플 혹은 배열"""
     return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
 
-
 def warp_image(image_path, src_pts, logger):
     """이미지 워핑 및 변환 수행"""
     # EXIF 데이터에서 초점 거리 추출
@@ -331,43 +332,89 @@ def warp_image(image_path, src_pts, logger):
     warped_img = cv2.warpPerspective(img, homography, (virtual_img.shape[1], virtual_img.shape[0]))
     cv2.imshow("warped_image", warped_img)
     cv2.waitKey(1)
-    return warped_img, homography
+    return warped_img, homography, virtual_img.shape
 
-def warp_image_test(image_path, src_pts, logger):
-    # 1) EXIF, 이미지 로딩
-    focal_length_mm, focal_length_35mm = get_exif_data(image_path, logger)
-    img = read_image(image_path)
+def verify_distortion_position(image_path, original_src_pts, homography, original_shape, original_warped_img, screws, logger):
+    """
+    src_pts에서 ±10 픽셀씩 섭동을 가했을 때, 스크류 중심점의 위치 변화(픽셀 단위)를 검증합니다.
     
-    # 2) 사다리꼴 각 변 길이
-    top_length    = distance(src_pts[0], src_pts[3])  # top-left -> top-right
-    bottom_length = distance(src_pts[1], src_pts[2])  # bottom-left -> bottom-right
-    left_length   = distance(src_pts[0], src_pts[1])
-    right_length  = distance(src_pts[3], src_pts[2])
+    Args:
+        image_path (Path): 이미지 파일 경로.
+        original_src_pts (np.ndarray): 원본 소스 포인트.
+        homography (np.ndarray): 원본 호모그래피 행렬.
+        original_shape (tuple): 원본 워핑 이미지의 형태 (height, width).
+        original_warped_img (np.ndarray): 원본 워핑 이미지.
+        screws (list of dict): 스크류 중심점 정보.
+        logger (Logger): 로깅 객체.
     
-    # warp할 최종 직사각형 크기 결정 (가장 긴 쪽에 맞춘 예시)
-    warp_width  = int(max(top_length, bottom_length))
-    warp_height = int(max(left_length, right_length))
-    
-    # 3) 목적지 좌표(직사각형)
-    dst_pts = np.array([
-        [0, 0],
-        [0, warp_height - 1],
-        [warp_width - 1, warp_height - 1],
-        [warp_width - 1, 0]
-    ], dtype=np.float32)
-    
-    # 4) 호모그래피
-    homography, _ = cv2.findHomography(src_pts.astype(np.float32), dst_pts)
-    if homography is None:
-        logger.error(f"Homography computation failed for image: {image_path}")
-        raise ValueError(f"Homography computation failed for image: {image_path}")
-    
-    # 5) 원근 변환
-    warped_img = cv2.warpPerspective(img, homography, (warp_width, warp_height))
-    
-    return warped_img, homography
+    Returns:
+        None
+    """
+    # 상하좌우 및 대각선 방향의 섭동을 포함하여 총 8개의 섭동 적용
+    perturbations = [
+        (-10, 0), (10, 0), (0, -10), (0, 10),    # 좌, 우, 위, 아래
+        (-10, -10), (-10, 10), (10, -10), (10, 10)   # 대각선: 좌상, 우상, 좌하, 우하
+    ]
+    error_logs = []
 
-
+    for idx, (dx, dy) in enumerate(perturbations, start=1):
+        perturbed_src_pts = deepcopy(original_src_pts)
+        # 각 src_pt에 섭동 적용
+        perturbed_src_pts += np.array([dx, dy], dtype=np.float64)
+        
+        # 새로운 호모그래피 계산
+        new_dst_pts = np.array([
+            [0, 0],
+            [0, original_shape[0] - 1],
+            [original_shape[1] - 1, original_shape[0] - 1],
+            [original_shape[1] - 1, 0]
+        ], dtype=np.float64)
+        
+        new_homography, status = cv2.findHomography(perturbed_src_pts, new_dst_pts)
+        if new_homography is None:
+            logger.error(f"Homography computation failed during distortion verification for perturbation {idx}: dx={dx}, dy={dy}")
+            continue
+        
+        # 스크류 중심점 변환 및 위치 변화 측정
+        position_changes = []
+        for screw in screws:
+            original_center = np.array([screw['center'][0], screw['center'][1], 1.0])
+            perturbed_center = new_homography @ original_center
+            if perturbed_center[2] == 0:
+                logger.error(f"Homography transformation resulted in zero w-component for screw: {screw['center']}, skipping.")
+                continue
+            perturbed_center /= perturbed_center[2]
+            perturbed_center = perturbed_center[:2]
+            
+            # 원본 호모그래피로 변환된 중심점
+            original_transformed = homography @ original_center
+            original_transformed /= original_transformed[2]
+            original_transformed = original_transformed[:2]
+            
+            # 위치 변화 계산
+            distance_change = np.linalg.norm(perturbed_center - original_transformed)
+            position_changes.append(distance_change)
+        
+        if position_changes:
+            max_change = max(position_changes)
+            mean_change = np.mean(position_changes)
+        else:
+            max_change = 0
+            mean_change = 0
+        
+        error_logs.append({
+            'perturbation': f'dx={dx}, dy={dy}',
+            'max_position_change': float(max_change),
+            'mean_position_change': float(mean_change)
+        })
+        
+        logger.info(f"Perturbation {idx}: dx={dx}, dy={dy} | Max Position Change: {max_change:.2f}px | Mean Position Change: {mean_change:.2f}px")
+    
+    # 요약 로그
+    logger.info("Distortion Verification Position Summary:")
+    logger.info(f"Image path : {image_path}")
+    for log in error_logs:
+        logger.info(f"Perturbation {log['perturbation']} | Max Position Change: {log['max_position_change']:.2f}px | Mean Position Change: {log['mean_position_change']:.2f}px")
 
 def process_images(source_directory, result_directory, logger):
     """이미지 파일들을 처리하는 함수"""
@@ -390,9 +437,7 @@ def process_images(source_directory, result_directory, logger):
                 src_pts = get_src_points(label_dict, logger)
                 
                 # 이미지 워핑
-                warped_image, homography = warp_image(image_path, src_pts, logger)
-                
-                # warped_image, homography = warp_imge_test(image_path, src_pts, logger)
+                warped_image, homography, virtual_shape = warp_image(image_path, src_pts, logger)
                 
                 # 원본 워핑 이미지 저장
                 org_warped_filename = file.stem + '_origin_warped.jpg'
@@ -405,6 +450,9 @@ def process_images(source_directory, result_directory, logger):
                 if not screws:
                     logger.warning(f"No valid 'SCREW' entries found for image: {file.name}, skipping connection process.")
                     continue
+                
+                # 왜곡 보정 검증 (위치 변화 측정)
+                verify_distortion_position(image_path, src_pts, homography, virtual_shape, warped_image, screws, logger)
                 
                 # 호모그래피 변환된 모든 SCREW 중심점과 크기를 리스트에 저장
                 transformed_screws = []
@@ -479,11 +527,11 @@ def process_images(source_directory, result_directory, logger):
             try:
                 # SCREW 간 거리 측정 및 선 그리기
                 if len(transformed_screws) >= 2:
-                    # 너비와 높이가 3 이상인 스크류만 필터링
+                    # 너비와 높이가 1.5 이상인 스크류만 필터링
                     filtered_screws = [s for s in transformed_screws if s['width'] >= 1.5 and s['height'] >= 1.5]
                     
                     if not filtered_screws:
-                        logger.warning("No screws with width and height >= 3.0 found.")
+                        logger.warning("No screws with width and height >= 1.5 found.")
                     else:
                         # x 좌표 기준으로 좌측에서 우측으로 정렬
                         sorted_screws = sorted(filtered_screws, key=lambda x: x['center'][0])
@@ -510,13 +558,13 @@ def process_images(source_directory, result_directory, logger):
                             min_distance = float('inf')
                             for idx in range(current_index + 1, len(sorted_screws)):
                                 screw = sorted_screws[idx]
-                                distance = math.sqrt(
+                                distance_val = math.sqrt(
                                     (screw['center'][0] - current_screw['center'][0]) ** 2 +
                                     (screw['center'][1] - current_screw['center'][1]) ** 2
                                 )
-                                if distance >= 150:
-                                    if distance < min_distance:
-                                        min_distance = distance
+                                if distance_val >= 150:
+                                    if distance_val < min_distance:
+                                        min_distance = distance_val
                                         next_screw = screw
                                     break  # 첫 번째 150 이상 거리의 스크류를 찾으면 루프 종료
                             
